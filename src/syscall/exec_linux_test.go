@@ -457,6 +457,90 @@ func TestUnshareUidGidMapping(t *testing.T) {
 	}
 }
 
+func TestUnshareNewIDExecutablesHelper(*testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+	defer os.Exit(0)
+	f, err := os.Open("/proc/self/uid_map")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	uidMap, err := io.ReadAll(f)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	fmt.Println("uidmap:")
+	fmt.Printf("%s", uidMap)
+
+	f, err = os.Open("/proc/self/gid_map")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	gidMap, err := io.ReadAll(f)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	fmt.Println("gidmap:")
+	fmt.Printf("%s", gidMap)
+}
+
+func TestUnshareNewIDExecutables(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("test exercises unprivileged user namespace, fails with privileges")
+	}
+	checkUserNS(t)
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestUnshareNewIDExecutablesHelper")
+	cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Unshareflags: syscall.CLONE_NEWUSER,
+		UidMappings: []syscall.SysProcIDMap{
+			{
+				ContainerID: 0,
+				HostID:      syscall.Getuid(),
+				Size:        1,
+			},
+		},
+		GidMappings: []syscall.SysProcIDMap{
+			{
+				ContainerID: 0,
+				HostID:      syscall.Getgid(),
+				Size:        1,
+			},
+		},
+	}
+	newuidmap, err := exec.LookPath("newuidmap")
+	if err != nil {
+		t.Fatalf("lookup newuidmap in path: %v", err)
+	}
+	cmd.SysProcAttr.NewUidMapExecutable = newuidmap
+
+	newgidmap, err := exec.LookPath("newgidmap")
+	if err != nil {
+		t.Fatalf("lookup newgidmap in path: %v", err)
+	}
+	cmd.SysProcAttr.NewGidMapExecutable = newgidmap
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Cmd failed with err %v, output: %s", err, out)
+	}
+	expectedLogsFormat := `uidmap:
+\t0\t%d\t1
+gidmap:
+\t0\t%d\t1`
+	expectedLogs := fmt.Sprintf(expectedLogsFormat, syscall.Getuid(), syscall.Getgid())
+	if expectedLogs != string(out) {
+		t.Fatalf("uidmap and gidmap differ from expected: \nExpected: %s\nGot: %s", expectedLogs, string(out))
+	}
+	t.Log(string(out))
+}
+
 type capHeader struct {
 	version uint32
 	pid     int32

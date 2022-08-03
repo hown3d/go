@@ -49,11 +49,13 @@ type SysProcAttr struct {
 	// the child process when the creating thread dies. Note that the signal
 	// is sent on thread termination, which may happen before process termination.
 	// There are more details at https://go.dev/issue/27505.
-	Pdeathsig    Signal
-	Cloneflags   uintptr        // Flags for clone calls (Linux only)
-	Unshareflags uintptr        // Flags for unshare calls (Linux only)
-	UidMappings  []SysProcIDMap // User ID mappings for user namespaces.
-	GidMappings  []SysProcIDMap // Group ID mappings for user namespaces.
+	Pdeathsig           Signal
+	Cloneflags          uintptr        // Flags for clone calls (Linux only)
+	Unshareflags        uintptr        // Flags for unshare calls (Linux only)
+	UidMappings         []SysProcIDMap // User ID mappings for user namespaces.
+	GidMappings         []SysProcIDMap // Group ID mappings for user namespaces.
+	NewUidMapExecutable string
+	NewGidMapExecutable string
 	// GidMappingsEnableSetgroups enabling setgroups syscall.
 	// If false, then setgroups syscall will be disabled for the child process.
 	// This parameter is no-op if GidMappings == nil. Otherwise for unprivileged
@@ -102,7 +104,7 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 		var err2 Errno
 		// uid/gid mappings will be written after fork and unshare(2) for user
 		// namespaces.
-		if sys.Unshareflags&CLONE_NEWUSER == 0 {
+		if sys.Unshareflags&CLONE_NEWUSER == 0 || (sys.NewUidMapExecutable != "" && sys.NewGidMapExecutable != "") {
 			if err := writeUidGidMappings(pid, sys); err != nil {
 				err2 = err.(Errno)
 			}
@@ -171,12 +173,12 @@ func forkAndExecInChild1(argv0 *byte, argv, envv []*byte, chroot, dir *byte, att
 		uidmap, setgroups, gidmap []byte
 	)
 
-	if sys.UidMappings != nil {
+	if sys.UidMappings != nil && sys.NewUidMapExecutable == "" {
 		puid = []byte("/proc/self/uid_map\000")
 		uidmap = formatIDMappings(sys.UidMappings)
 	}
 
-	if sys.GidMappings != nil {
+	if sys.GidMappings != nil && sys.NewUidMapExecutable == "" {
 		psetgroups = []byte("/proc/self/setgroups\000")
 		pgid = []byte("/proc/self/gid_map\000")
 
@@ -307,7 +309,7 @@ func forkAndExecInChild1(argv0 *byte, argv, envv []*byte, chroot, dir *byte, att
 			goto childerror
 		}
 
-		if sys.Unshareflags&CLONE_NEWUSER != 0 && sys.GidMappings != nil {
+		if sys.Unshareflags&CLONE_NEWUSER != 0 && sys.GidMappings != nil && sys.NewGidMapExecutable == "" {
 			dirfd := int(_AT_FDCWD)
 			if fd1, _, err1 = RawSyscall6(SYS_OPENAT, uintptr(dirfd), uintptr(unsafe.Pointer(&psetgroups[0])), uintptr(O_WRONLY), 0, 0, 0); err1 != 0 {
 				goto childerror
@@ -332,7 +334,7 @@ func forkAndExecInChild1(argv0 *byte, argv, envv []*byte, chroot, dir *byte, att
 			}
 		}
 
-		if sys.Unshareflags&CLONE_NEWUSER != 0 && sys.UidMappings != nil {
+		if sys.Unshareflags&CLONE_NEWUSER != 0 && sys.UidMappings != nil && sys.NewUidMapExecutable == "" {
 			dirfd := int(_AT_FDCWD)
 			if fd1, _, err1 = RawSyscall6(SYS_OPENAT, uintptr(dirfd), uintptr(unsafe.Pointer(&puid[0])), uintptr(O_WRONLY), 0, 0, 0); err1 != 0 {
 				goto childerror
@@ -605,22 +607,59 @@ func writeSetgroups(pid int, enable bool) error {
 // for a process and it is called from the parent process.
 func writeUidGidMappings(pid int, sys *SysProcAttr) error {
 	if sys.UidMappings != nil {
-		uidf := "/proc/" + itoa.Itoa(pid) + "/uid_map"
-		if err := writeIDMappings(uidf, sys.UidMappings); err != nil {
-			return err
+		if sys.NewUidMapExecutable != "" {
+			if err := runNewIDExectuable(sys.NewUidMapExecutable, pid, sys.UidMappings); err != nil {
+				return err
+			}
+		} else {
+			uidf := "/proc/" + itoa.Itoa(pid) + "/uid_map"
+			if err := writeIDMappings(uidf, sys.UidMappings); err != nil {
+				return err
+			}
 		}
 	}
-
 	if sys.GidMappings != nil {
-		// If the kernel is too old to support /proc/PID/setgroups, writeSetGroups will return ENOENT; this is OK.
-		if err := writeSetgroups(pid, sys.GidMappingsEnableSetgroups); err != nil && err != ENOENT {
-			return err
-		}
-		gidf := "/proc/" + itoa.Itoa(pid) + "/gid_map"
-		if err := writeIDMappings(gidf, sys.GidMappings); err != nil {
-			return err
+		if sys.NewGidMapExecutable != "" {
+			if err := runNewIDExectuable(sys.NewGidMapExecutable, pid, sys.GidMappings); err != nil {
+				return err
+			}
+		} else {
+			// If the kernel is too old to support /proc/PID/setgroups, writeSetGroups will return ENOENT; this is OK.
+			if err := writeSetgroups(pid, sys.GidMappingsEnableSetgroups); err != nil && err != ENOENT {
+				return err
+			}
+			gidf := "/proc/" + itoa.Itoa(pid) + "/gid_map"
+			if err := writeIDMappings(gidf, sys.GidMappings); err != nil {
+				return err
+			}
 		}
 	}
 
 	return nil
+}
+
+func runNewIDExectuable(path string, pid int, mappings []SysProcIDMap) error {
+	args := []string{
+		path,
+		itoa.Itoa(pid),
+	}
+	for _, m := range mappings {
+		args = append(args, itoa.Itoa(m.ContainerID))
+		args = append(args, itoa.Itoa(m.HostID))
+		args = append(args, itoa.Itoa(m.Size))
+	}
+
+	// This is currently not working, because the process will hung.
+	// Reason is the ForkMutex is locked from previous fork and not released yet.
+	execPid, err := ForkExec(path, args, nil)
+	if err != nil {
+		return err
+	}
+
+	var wstatus WaitStatus
+	_, err = Wait4(execPid, &wstatus, 0, nil)
+	for err == EINTR {
+		_, err = Wait4(execPid, &wstatus, 0, nil)
+	}
+	return err
 }
